@@ -1,0 +1,17 @@
+agent: a2c
+model: lstm
+num_envs: 8
+rollout_len: 256
+d_model: 128
+n_layers: 1
+d_actor: 128
+d_critic: 128
+gamma: 0.99
+lamb: 0.95
+entropy_coef: 0.01
+value_coef: 0.5
+max_grad_norm: 0.5
+optimizer:
+  learning_rate: 0.0001
+arg_max: false
+reset_on_terminate: true

@@ -1,0 +1,4 @@
+task: minigrid_onehot
+name: MiniGrid-MemoryS13Random-v0
+view_size: 3
+max_steps: null

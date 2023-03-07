@@ -1,0 +1,4 @@
+task: minigrid_pixel
+name: MiniGrid-DoorKey-5x5-v0
+view_size: 7
+max_steps: null

@@ -1,0 +1,4 @@
+minigrid
+jax
+flax
+numpy
