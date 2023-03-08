@@ -3,4 +3,5 @@ jax
 flax
 numpy
 optax
+rlax
 chex=0.1.5
