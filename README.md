@@ -1,7 +1,8 @@
 # PPO-Jax
 
-This is a reimplementation of PPO+LSTM algorithm adapted from CleanRL PPO+LSTM. PPO+LSTM is a variant of the Proximal Policy Optimization (PPO) algorithm that incorporates a Long Short-Term Memory (LSTM) neural network to model temporal dependencies in sequential decision-making tasks. 
+This is a reimplementation of Recurrent PPO and A2C algorithm adapted from CleanRL PPO+LSTM. Recurrent PPO is a variant of the Proximal Policy Optimization (PPO) algorithm that incorporates a Recurrent Neural Network (RNN) to model temporal dependencies in sequential decision-making tasks. 
 
+**Currently Supported Models:** Multilayered-LSTM, Multilayered-GRU
 **Default supported environments:** MiniGrid
 
 ## Usage
