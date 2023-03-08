@@ -68,7 +68,7 @@ class ControlTrainer(BaseTrainer):
         #We will create two environments, one for training (vectorized) and one for evaluation
         train_seeds=np.random.randint(0,9999,size=self.num_envs,dtype=int).tolist()
         eval_seeds=int(np.random.randint(0,9999,size=1,dtype=int))
-        train_envs=gym.vector.SyncVectorEnv([lambda: EpisodeStatisticsWrapper(AutoResetWrapper(env_fn()))for seed in train_seeds])
+        train_envs=gym.vector.AsyncVectorEnv([lambda: EpisodeStatisticsWrapper(AutoResetWrapper(env_fn()))for seed in train_seeds])
         eval_env=RecordRollout(AutoResetWrapper(env_fn()))
         train_envs.reset(seed=train_seeds)
         eval_env.reset(seed=eval_seeds)

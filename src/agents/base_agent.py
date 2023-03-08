@@ -12,7 +12,11 @@ from src.models.actor_critic import ActorCriticModel
 from argparse import Namespace
 
 
+def jax_to_numpy(*args):
+    return jax.tree_map(lambda x: np.array(x),args)
 
+def numpy_to_jax(*args):
+    return jax.tree_map(lambda x: jnp.array(x,dtype=jnp.float32),args)
 
 class BaseAgent:
     def __init__(self,train_envs,eval_env,rollout_len,repr_model_fn:Callable,seq_model_fn:Callable,
@@ -116,7 +120,8 @@ class BaseAgent:
             else:
                 acts_tick=jax.random.categorical(random_key,act_logits).squeeze(axis=-1)
             #Take a step in the environment
-            o_tickplus1,r_tickplus1,term_tickplus1,trunc_tickplus1,info=self.env.step(acts_tick)
+            o_tickplus1,r_tickplus1,term_tickplus1,trunc_tickplus1,info=self.env.step(*jax_to_numpy(acts_tick))
+            o_tickplus1,r_tickplus1,term_tickplus1,trunc_tickplus1=numpy_to_jax(o_tickplus1,r_tickplus1,term_tickplus1,trunc_tickplus1)
             term_tickplus1=jnp.logical_or(term_tickplus1,trunc_tickplus1)
             #Add action at timestep tick 
             critic_preds.append(v_tick.copy())
@@ -180,7 +185,8 @@ class BaseAgent:
                         acts_tick=jnp.argmax(act_logits - jnp.log(-jnp.log(u)), axis=-1).squeeze(axis=-1)
                     else:
                         acts_tick=jax.random.categorical(random_key,act_logits).squeeze(axis=-1)
-                o_tick,r_tick,term,trunc,info=self.eval_env.step(acts_tick)
+                o_tick,r_tick,term,trunc,info=self.eval_env.step(*jax_to_numpy(acts_tick))
+                o_tick,r_tick,term,trunc=numpy_to_jax(o_tick,r_tick,term,trunc)
                 done=term or trunc
                 rewards.append(r_tick)
                 h_tickminus1=htick

@@ -2,3 +2,5 @@ minigrid
 jax
 flax
 numpy
+optax
+chex=0.1.5
