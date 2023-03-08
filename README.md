@@ -1,4 +1,4 @@
-# Recurrent PPO-Jax
+# Recurrent PPO in Jax
 
 This is a reimplementation of Recurrent PPO and A2C algorithm adapted from CleanRL PPO+LSTM. Recurrent PPO is a variant of the Proximal Policy Optimization (PPO) algorithm that incorporates a Recurrent Neural Network (RNN) to model temporal dependencies in sequential decision-making tasks. 
 
