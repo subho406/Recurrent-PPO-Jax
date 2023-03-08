@@ -3,5 +3,6 @@ jax
 flax
 numpy
 optax
+gymnasium
 rlax
 chex=0.1.5
