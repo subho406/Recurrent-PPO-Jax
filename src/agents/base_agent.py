@@ -11,12 +11,12 @@ from src.utils import tree_index
 from src.models.actor_critic import ActorCriticModel
 from argparse import Namespace
 
-
 def jax_to_numpy(*args):
     return jax.tree_map(lambda x: np.array(x),args)
 
-def numpy_to_jax(*args):
-    return jax.tree_map(lambda x: jnp.array(x,dtype=jnp.float32),args)
+def numpy_to_jax(*args,dtype=jnp.float32):
+    return jax.tree_map(lambda x: jnp.array(x,dtype=dtype),args)
+
 
 class BaseAgent:
     def __init__(self,train_envs,eval_env,rollout_len,repr_model_fn:Callable,seq_model_fn:Callable,
@@ -54,7 +54,7 @@ class BaseAgent:
         self.tick=0
         self.o_tick,_=self.env.reset()
         self.r_tick=jnp.zeros(self.env.num_envs)
-        self.term_tick=jnp.zeros(self.env.num_envs,dtype=jnp.int8)
+        self.term_tick=jnp.full((self.env.num_envs),True)
         self.h_tickminus1=jax.tree_map(lambda x: jnp.repeat(jnp.expand_dims(x,axis=0),self.env.num_envs,axis=0),self.seq_init())
         self._params=self.ac_model.init({'params':params_key,'random':random_key},jnp.expand_dims(self.o_tick,1),jnp.expand_dims(self.term_tick,1),
                                        self.h_tickminus1)
@@ -121,7 +121,8 @@ class BaseAgent:
                 acts_tick=jax.random.categorical(random_key,act_logits).squeeze(axis=-1)
             #Take a step in the environment
             o_tickplus1,r_tickplus1,term_tickplus1,trunc_tickplus1,info=self.env.step(*jax_to_numpy(acts_tick))
-            o_tickplus1,r_tickplus1,term_tickplus1,trunc_tickplus1=numpy_to_jax(o_tickplus1,r_tickplus1,term_tickplus1,trunc_tickplus1)
+            o_tickplus1,r_tickplus1=numpy_to_jax(o_tickplus1,r_tickplus1)
+            term_tickplus1,trunc_tickplus1=numpy_to_jax(term_tickplus1,trunc_tickplus1,dtype=bool)
             term_tickplus1=jnp.logical_or(term_tickplus1,trunc_tickplus1)
             #Add action at timestep tick 
             critic_preds.append(v_tick.copy())
@@ -144,7 +145,7 @@ class BaseAgent:
         #Update to timestep
         self.o_tick=o_tick.copy()
         self.r_tick=r_tick.copy()
-        self.h_tickminus1=h_tickminus1.copy()
+        self.h_tickminus1=jax.tree_map(lambda x:x,h_tickminus1) #Copy the hidden state, it can be arbitrary tree structure
         self.term_tick=term_tick.copy()
         #Shape is num_actorsXrollout_lenX*...
         return Namespace(**{
@@ -166,15 +167,17 @@ class BaseAgent:
         episode_lens=[]
         episode_avgreturns=[]
         rollouts=[]
+        term_tick=jnp.zeros((1,1),dtype=bool)  #Initialize terminal state to False
+        #Initialize zero hidden state at the start, whether it is reset or not depends on reset_on_terminate param
+        h_tickminus1=jax.tree_map(lambda x:jnp.expand_dims(jnp.zeros(x[0].shape),0) ,self.h_tickminus1)
         for i in tqdm.tqdm(range(eval_episodes)):
             done=False
             rewards=[]
-            #Initialize zero hidden state at the start of each episode, shape is infered from the hidden state of the first environment
-            h_tickminus1=jax.tree_map(lambda x:jnp.expand_dims(jnp.zeros(x[0].shape),0) ,self.h_tickminus1)
+                         
             while not done:
                 #Take a step in the environment
                 random_key,model_key=jax.random.split(random_key)
-                act_logits,v_tick,htick=self.actor_critic_fn(model_key,self.params,jnp.expand_dims(o_tick,axis=(0,1)),jnp.ones((1,1)),h_tickminus1)
+                act_logits,v_tick,htick=self.actor_critic_fn(model_key,self.params,jnp.expand_dims(o_tick,axis=(0,1)),term_tick,h_tickminus1)
                 if hasattr(self,'arg_max') and self.arg_max:
                     acts_tick=jnp.argmax(act_logits,axis=-1)
                 else:
@@ -186,8 +189,9 @@ class BaseAgent:
                     else:
                         acts_tick=jax.random.categorical(random_key,act_logits).squeeze(axis=-1)
                 o_tick,r_tick,term,trunc,info=self.eval_env.step(*jax_to_numpy(acts_tick))
-                o_tick,r_tick,term,trunc=numpy_to_jax(o_tick,r_tick,term,trunc)
+                o_tick,r_tick=numpy_to_jax(o_tick,r_tick)
                 done=term or trunc
+                term_tick=jnp.array([[done]],dtype=bool) #Carry forward the termination signal for the next timestep, shape expected by the actor_critic_fn is BXT
                 rewards.append(r_tick)
                 h_tickminus1=htick
             #Get the rollout frames
