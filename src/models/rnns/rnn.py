@@ -3,6 +3,7 @@ import jax.nn as nn
 import numpy as np
 import jax
 
+from src.utils import tree_index
 from flax import linen as nn
 from flax.linen.initializers import constant, orthogonal
 
@@ -21,9 +22,10 @@ class LSTM(nn.Module):
         class LSTMout(nn.Module):
             @nn.compact    
             def __call__(self,carry,inputs):
-                inputs,terminations=inputs
+                inputs,terminate=inputs
                 if reset_on_terminate:
-                    carry=jax.tree_map(lambda x: x*(1.0-terminations),carry) #Stop gradient if termination
+                    #Reset hidden state on termination
+                    carry=jax.lax.cond(terminate,lambda:jax.tree_map(lambda x:jnp.zeros_like(x),carry),lambda:carry)
                 (new_c, new_h), new_h=nn.OptimizedLSTMCell(kernel_init=orthogonal(jnp.sqrt(2)),
                             recurrent_kernel_init=orthogonal(jnp.sqrt(2)),bias_init=constant(0.0))(carry,inputs)
                 return (new_c, new_h), ((new_c, new_h),new_h)
@@ -54,6 +56,7 @@ class LSTMMultiLayer(nn.Module):
                 y_t, new_memory[i] = LSTM(self.d_model,self.reset_on_terminate)(inputs, terminations,last_states[i])
             else:
                 y_t, new_memory[i] = LSTM(self.d_model,self.reset_on_terminate)(y_t, terminations,last_states[i])
+        new_memory=tree_index(new_memory,-1)
         return y_t, new_memory
     
     @staticmethod
@@ -74,9 +77,9 @@ class GRU(nn.Module):
         class GRUout(nn.Module):
             @nn.compact    
             def __call__(self,carry,inputs):
-                inputs,terminations=inputs
+                inputs,terminate=inputs
                 if reset_on_terminate:
-                    carry=jax.tree_map(lambda x: x*(1.0-terminations),carry) #Stop gradient if termination
+                    carry=jax.lax.cond(terminate,lambda:jax.tree_map(lambda x:jnp.zeros_like(x),carry),lambda:carry)
                 new_c, new_h=nn.GRUCell(kernel_init=orthogonal(jnp.sqrt(2)),
                             recurrent_kernel_init=orthogonal(jnp.sqrt(2)),bias_init=constant(0.0))(carry,inputs)
                 return new_c, (new_c,new_h)
@@ -99,6 +102,8 @@ class GRUMultiLayer(nn.Module):
         """
         inputs: TXinput_dim
         terminations: T
+
+        returns: new hidden state after processing the input
         """
         new_memory=[None]*self.n_layers
         for i in range(self.n_layers):
@@ -106,6 +111,7 @@ class GRUMultiLayer(nn.Module):
                 y_t, new_memory[i] = GRU(self.d_model,self.reset_on_terminate)(inputs, terminations,last_states[i])
             else:
                 y_t, new_memory[i] = GRU(self.d_model,self.reset_on_terminate)(y_t, terminations,last_states[i])
+        new_memory=tree_index(new_memory,-1)
         return y_t, new_memory
     
     @staticmethod
