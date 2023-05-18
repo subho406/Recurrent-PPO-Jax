@@ -1,9 +1,6 @@
 agent: a2c
-model: gru
 num_envs: 8
-rollout_len: 256
-d_model: 128
-n_layers: 1
+rollout_len: 128
 d_actor: 128
 d_critic: 128
 gamma: 0.99
@@ -14,4 +11,6 @@ max_grad_norm: 0.5
 optimizer:
   learning_rate: 0.0001
 arg_max: false
-reset_on_terminate: true
+defaults:
+  - _self_
+  - seq_model: lstm

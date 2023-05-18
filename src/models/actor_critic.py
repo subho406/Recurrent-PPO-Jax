@@ -33,9 +33,7 @@ class ActorCriticModel(nn.Module):
         # TXlatent_dim, image or otherwise, they are always flattened
         rep=rep.reshape(rep.shape[0],-1)
         seq_rep,memory=self.seq_model(rep,terminations,last_memory)
-        memory=tree_index(memory,-1)
         actor_out=self.actor(seq_rep)
         critic_out=self.critic(seq_rep)
         return actor_out,critic_out,memory
-
 

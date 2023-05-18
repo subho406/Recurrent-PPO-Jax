@@ -1,0 +1,4 @@
+name: lstm
+d_model: 128
+n_layers: 1
+reset_hidden_on_terminate: true

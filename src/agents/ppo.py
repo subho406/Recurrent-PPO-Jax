@@ -7,6 +7,7 @@ import tqdm
 import jax.numpy as jnp
 import numpy as np
 import time
+import optax
 
 from flax.training.train_state import TrainState
 from src.models.actor_critic import *
@@ -19,36 +20,41 @@ class PPOAgent(BaseAgent):
 
     def __init__(self,train_envs,eval_env,repr_model_fn:Callable,seq_model_fn:Tuple[Callable,Callable],
                         actor_fn:Callable,critic_fn:Callable,optimizer:optax.GradientTransformation,
-                         num_steps=128, anneal_lr=True, gamma=0.99,
+                         num_steps=128, gamma=0.99, lr_schedule=optax.linear_schedule,
                         gae_lambda=0.95, num_minibatches=4, update_epochs=4, norm_adv=True,
-                        clip_coef=0.1, ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5,
-                        target_kl=None) -> None:
+                        clip_coef=0.1, ent_schedule=optax.Schedule, vf_coef=0.5, max_grad_norm=0.5,
+                        target_kl=None,sequence_length=None) -> None:
 
         super(PPOAgent,self).__init__(train_envs=train_envs,eval_env=eval_env,rollout_len=num_steps,repr_model_fn=repr_model_fn,seq_model_fn=seq_model_fn,
-                        actor_fn=actor_fn,critic_fn=critic_fn,use_gumbel_sampling=True)
+                        actor_fn=actor_fn,critic_fn=critic_fn,use_gumbel_sampling=True,sequence_length=sequence_length)
         
         self.optimizer=optimizer
         self.num_envs = self.env.num_envs
-        self.anneal_lr = anneal_lr
         self.gamma = gamma
+        self.lr_schedule = lr_schedule
         self.gae_lambda = gae_lambda
         self.num_minibatches = num_minibatches
         self.update_epochs = update_epochs
         self.norm_adv = norm_adv
         self.clip_coef = clip_coef
-        self.ent_coef = ent_coef
+        self.ent_schedule = ent_schedule
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
         self.target_kl = target_kl
-
+        self.update_tick=jnp.array(0)
     
         @jax.jit
         def update_ppo(
-            params,optimizer_state,random_key,h_tickminus1,
-            data_batch
+            params,optimizer_state,random_key,
+            data_batch,update_tick
         ):
+            
+            #Update lr
+            
+            optimizer_state[1].hyperparams['learning_rate']=self.lr_schedule(update_tick)
+            
+            
             Glambda_fn=jax.vmap(rlax.lambda_returns)
-
             observations,actions,rewards,terminations,critic_preds,actor_preds=data_batch['observations'],data_batch['actions'], \
                                             data_batch['rewards'],data_batch['terminations'],data_batch['critic_preds'],data_batch['actor_preds']
             gammas=self.gamma*(1-terminations)
@@ -65,7 +71,7 @@ class PPOAgent(BaseAgent):
             logprobs=logprobs[jnp.arange(B*T),actions.reshape(-1)].reshape(B,T)
             #Calculate log probs of actions takenß
             
-
+            
             def ppo_loss(params, random_key, mb_observations, mb_actions,mb_terminations,
                             mb_logp, mb_advantages, mb_returns,mb_h_tickminus1):
                 logits_new,values_new,_=self.actor_critic_fn(random_key,params,mb_observations,mb_terminations,
@@ -96,38 +102,69 @@ class PPOAgent(BaseAgent):
                 v_loss = 0.5 * ((values_new - mb_returns) ** 2).mean()
 
                 entropy_loss = entropy.mean()
-                loss = pg_loss - self.ent_coef * entropy_loss + v_loss * self.vf_coef
+                loss = pg_loss - self.ent_schedule(update_tick) * entropy_loss + v_loss * self.vf_coef
                 return loss, (pg_loss, v_loss, entropy_loss, jax.lax.stop_gradient(approx_kl))
 
             ppo_loss_grad_fn = jax.value_and_grad(ppo_loss, has_aux=True)
 
-            envsperbatch = self.num_envs // self.num_minibatches
-            env_inds=jnp.arange(self.num_envs,dtype=int)
 
             #Use observations tick to tick+rollout_len
             observations=observations[:,:-1]
             terminations=terminations[:,:-1]
-            for _ in range(self.update_epochs):
-                shuffle_key, model_key,random_key = jax.random.split(random_key,3)
-                env_inds=jax.random.shuffle(shuffle_key,env_inds)
-                for start in range(0, self.num_envs, self.num_minibatches):
-                    end = start + envsperbatch
-                    mbenvinds = env_inds[start:end]
+            hiddens=data_batch['hiddens'] #A Pytree of with the leading dimension of shape num_envs*num_seqs
+            hidden_indices=data_batch['hidden_indices'] #A jax array of shape (num_envsXnum_seqsXseq_len)
+            num_seqs=hidden_indices.shape[1]
+
+            #We are gonna minibatch over num_envs and num_seqs now
+
+            def update_epoch(carry,x):
+                params,optimizer_state,random_key=carry
+                shuffle_key,model_key,random_key = jax.random.split(random_key,3)
+                shuffled_inds = jax.random.permutation(shuffle_key, self.num_envs*num_seqs)
+                batch_inds = shuffled_inds.reshape((self.num_minibatches, -1))
+                #We are gonna minibatch over num_envs and num_seqs now
+                def minibatch_update(carry,x):
+                    params,optimizer_state,model_key=carry
+                    batch_ind=x
+                    mbenvinds=batch_ind//num_seqs
+                    mbseqinds=batch_ind%num_seqs
                     model_key, _ = jax.random.split(model_key)
-                    mb_h_tickminus1=jax.tree_map(lambda x:x[mbenvinds],h_tickminus1)
+                    hidden_indices_mb=hidden_indices[mbenvinds,mbseqinds]
+                    mb_h_tickminus1=jax.tree_map(lambda x:x[mbenvinds,mbseqinds],hiddens)
+
+                    #We first index by the minibatch envs and then by the indices for the corresponding timestep in those minibatches
+                    # The first index is the env id and the second index is the timestep id
+                    # In numpy the 2nd index needs column id corresponding to each row (ie each env id) so index with an array of shape (num_timesteps,num_envs)
+                    # We need to transpose two times to get the right shape
+                    mb_observations=observations[mbenvinds,hidden_indices_mb.T].transpose((1,0)+tuple(range(2,observations.ndim)))
+                    mb_actions=actions[mbenvinds,hidden_indices_mb.T].transpose((1,0)+tuple(range(2,actions.ndim)))
+                    mb_terminations=terminations[mbenvinds,hidden_indices_mb.T].transpose((1,0)+tuple(range(2,terminations.ndim)))
+                    mb_logp=logprobs[mbenvinds,hidden_indices_mb.T].transpose((1,0)+tuple(range(2,logprobs.ndim)))
+                    mb_advantages=advantages[mbenvinds,hidden_indices_mb.T].transpose((1,0)+tuple(range(2,advantages.ndim)))
+                    mb_returns=Glambdas[mbenvinds,hidden_indices_mb.T].transpose((1,0)+tuple(range(2,Glambdas.ndim)))
                     (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = ppo_loss_grad_fn(
-                        params,
-                        model_key,
-                        observations[mbenvinds],
-                        actions[mbenvinds],
-                        terminations[mbenvinds],
-                        logprobs[mbenvinds],
-                        advantages[mbenvinds],
-                        Glambdas[mbenvinds],
-                        mb_h_tickminus1
-                    )
-                    updates,optimizer_state=self.optimizer.update(grads,optimizer_state)
-                    params=optax.apply_updates(params,updates)
+                         params,
+                         model_key,
+                         mb_observations,
+                         mb_actions,
+                         mb_terminations,
+                         mb_logp,
+                         mb_advantages,
+                         mb_returns,
+                         mb_h_tickminus1
+                     )
+                    updates,optimizer_state = self.optimizer.update(grads, optimizer_state, params)
+                    params = optax.apply_updates(params, updates)
+                    return (params,optimizer_state,model_key),(loss, pg_loss, v_loss, entropy_loss, approx_kl)
+                
+                (params,optimizer_state,model_key),losses=jax.lax.scan(minibatch_update,(params,optimizer_state,model_key),batch_inds)
+                losses=jax.tree_map(lambda x:x.mean(),losses)
+                return (params,optimizer_state,random_key),losses
+            
+            
+            (params,optimizer_state,random_key),losses=jax.lax.scan(update_epoch,(params,optimizer_state,random_key),jnp.arange(self.update_epochs))
+            losses=jax.tree_map(lambda x:x.mean(),losses)
+            loss, pg_loss, v_loss, entropy_loss, approx_kl=losses
             return (loss, pg_loss, v_loss, entropy_loss, approx_kl),params, optimizer_state
         self.update_ppo = update_ppo
 
@@ -135,19 +172,22 @@ class PPOAgent(BaseAgent):
     def reset(self,params_key,random_key):
         super(PPOAgent,self).reset(params_key,random_key)
         self.optimizer_state=self.optimizer.init(self.params)
+        self.update_tick=jnp.array(0)
 
     def step(self,random_key):
         #Unroll actor for rollout_len steps
-        h_tickminus1=self.h_tickminus1.copy()
+
+        h_tickminus1=jax.tree_map(lambda x: x,self.h_tickminus1) #Copy the hidden states
         #Need to remove values
         unroll_key,update_key=jax.random.split(random_key)
         databatch=self.unroll_actors(unroll_key)
         databatch=vars(databatch)
         infos=databatch.pop('infos')
         (loss, pg_loss, v_loss, entropy_loss, approx_kl),self.params, self.optimizer_state=self.update_ppo(self.params,
-                                self.optimizer_state,update_key,h_tickminus1,databatch)
+                                self.optimizer_state,update_key,databatch,self.update_tick)
         
         rewards=databatch['rewards']
+        self.update_tick=self.update_tick+1
         return (loss,(v_loss,entropy_loss,pg_loss,rewards),infos) #Will clean this up later
 
 

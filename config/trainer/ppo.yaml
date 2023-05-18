@@ -1,0 +1,29 @@
+agent: ppo
+d_actor: 128
+d_critic: 128
+num_envs: 8
+rollout_len: 256
+sequence_length: null
+gamma: 0.99
+gae_lambda: 0.95
+num_minibatches: 8
+update_epochs: 4
+norm_adv: true
+clip_coef: 0.1
+ent_coef: 
+  initial: 0.01
+  final: null
+  max_decay_steps: 1000
+  power: 1
+
+vf_coef: 0.5
+max_grad_norm: 0.5
+optimizer: 
+  learning_rate: 
+    initial: 2.5e-4
+    final: null
+    max_decay_steps: 1000
+    power: 1
+defaults:
+  - _self_
+  - seq_model: lstm

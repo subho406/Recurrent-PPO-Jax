@@ -1,12 +1,12 @@
 tags: null
-project_name: "minigrid"
+project_name: "default_project"
 seed: 1
 steps: 10000000
 log_interval: 10000
-eval_episodes: 10
+eval_episodes: 20
 eval_interval: 500000
 use_wandb: false
 defaults:
   - _self_
-  - task: minigrid_pixel
-  - trainer: ppo_lstm
+  - task: minigrid_onehot
+  - trainer: ppo

@@ -1,0 +1,10 @@
+name: gtrxl
+head_dim: 32
+embedding_dim: 64
+head_num: 2
+mlp_num: 2
+layer_num: 2
+dropout_ratio: 0.0
+gru_bias: 2.
+memory_len: 128
+reset_hidden_on_terminate: true

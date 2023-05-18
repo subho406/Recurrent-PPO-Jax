@@ -5,7 +5,8 @@ import pandas as pd
 import rlax
 import wandb
 import gymnasium as gym
-
+import time
+import logging
 from argparse import Namespace
 from src.trainers.base_trainer import BaseTrainer
 from collections import OrderedDict
@@ -16,16 +17,22 @@ from src.model_fns import *
 from src.tasks.envs.wrappers import *
 from src.trainers.utils import *
 from gymnasium.wrappers import AutoResetWrapper
+from omegaconf import DictConfig, OmegaConf
+
+
+logger = logging.getLogger(__name__)
+
 
 def get_env_initializers(env_config):
+    env_config=OmegaConf.to_container(env_config)
     if env_config['task']=='minigrid_pixel':
         env_fn=lambda: create_minigrid_env_pixel(**env_config)
         repr_fn=atari_conv_repr_model()
+        return env_fn,env_fn,repr_fn
     elif env_config['task']=='minigrid_onehot':
         env_fn=lambda: create_minigrid_env_onehot(**env_config)
         repr_fn=flatten_repr_model()
-    return env_fn,repr_fn
-
+        return env_fn,env_fn,repr_fn
 
 class ControlTrainer(BaseTrainer):
 
@@ -57,29 +64,41 @@ class ControlTrainer(BaseTrainer):
             - seed: Seed for random number generation.
         """
 
-        env_fn,repr_fn=get_env_initializers(kwargs['env_config'])
+        env_fn,eval_env_fn,repr_fn=get_env_initializers(kwargs['env_config'])
         self.wandb_run=kwargs['wandb_run']
         self.trainer_config=kwargs['trainer_config']
         self.env_config=kwargs['env_config']
         self.global_config=kwargs['global_args']
+        self.checkpoint_dir=self.global_config.get('checkpoint_dir',None)
+        self.checkpoint_interval=self.global_config.get('checkpoint_interval',None)
         self.rollout_len=self.trainer_config['rollout_len']
         self.num_envs=self.trainer_config['num_envs']
         self.gamma=self.trainer_config['gamma']
         #We will create two environments, one for training (vectorized) and one for evaluation
         train_seeds=np.random.randint(0,9999,size=self.num_envs,dtype=int).tolist()
         eval_seeds=int(np.random.randint(0,9999,size=1,dtype=int))
-        train_envs=gym.vector.AsyncVectorEnv([lambda: EpisodeStatisticsWrapper(AutoResetWrapper(env_fn()))for seed in train_seeds])
-        eval_env=RecordRollout(AutoResetWrapper(env_fn()))
+        env_type=kwargs['trainer_config'].get('env_pool','async')
+        if env_type=='async':
+            import functools
+            env_type=gym.vector.AsyncVectorEnv
+        elif env_type=='sync':
+            env_type=gym.vector.SyncVectorEnv
+        train_envs=env_type([lambda: EpisodeStatisticsWrapper(AutoResetWrapper((env_fn())))for seed in train_seeds],shared_memory=False)
+        eval_env=RecordRollout(AutoResetWrapper(eval_env_fn()))
         train_envs.reset(seed=train_seeds)
         eval_env.reset(seed=eval_seeds)
-        
+        logger.info("Observation space: "+str(eval_env.observation_space))
+        logger.info("Action space: "+str(eval_env.action_space))
 
         params_key,self.random_key=jax.random.split(kwargs['key'])
         
-        if self.trainer_config['model']=='lstm':
-            model_fn=seq_model_lstm(self.trainer_config['d_model'],self.trainer_config['n_layers'],reset_on_terminate=self.trainer_config.get('reset_on_terminate',True))
-        elif self.trainer_config['model']=='gru':
-            model_fn=seq_model_gru(self.trainer_config['d_model'],self.trainer_config['n_layers'],reset_on_terminate=self.trainer_config.get('reset_on_terminate',True))
+        if self.trainer_config.seq_model.name=='lstm':
+            model_fn=seq_model_lstm(**self.trainer_config['seq_model'])
+        elif self.trainer_config.seq_model.name=='gru':
+            model_fn=seq_model_gru(**self.trainer_config['seq_model'])
+        elif self.trainer_config.seq_model.name=='gtrxl':
+            model_fn=seq_model_gtrxl(**self.trainer_config['seq_model'])
+
         actor_fn=actor_model_discete(self.trainer_config['d_actor'],eval_env.action_space.n)
         critic_fn=critic_model(self.trainer_config['d_critic'])
         #Setup optimizer
@@ -100,34 +119,35 @@ class ControlTrainer(BaseTrainer):
             num_updates = self.global_config.steps // batch_size
             optimizer_config = dict(self.trainer_config.optimizer)
             learning_rate=optimizer_config.pop("learning_rate")
-            def linear_schedule(count):
-                # anneal learning rate linearly after one training iteration which contains
-                # (args.num_minibatches * args.update_epochs) gradient updates
-                frac = 1.0 - (count // (self.trainer_config['num_minibatches'] * 
-                            self.trainer_config['update_epochs'])) / num_updates
-                return learning_rate * frac
+            if learning_rate['final'] is None:
+                learning_rate['final']=learning_rate['initial'] #Set to none if you don't want decay
+            if self.trainer_config['ent_coef']['final'] is None:
+                self.trainer_config['ent_coef']['final']=self.trainer_config['ent_coef']['initial']
+            lr_schedule=optax.polynomial_schedule(learning_rate['initial'],learning_rate['final'],learning_rate['power'],learning_rate['max_decay_steps'])
+            ent_schedule=optax.polynomial_schedule(self.trainer_config['ent_coef']['initial'],self.trainer_config['ent_coef']['final'],
+                                                   self.trainer_config['ent_coef']['power'],self.trainer_config['ent_coef']['max_decay_steps'])
 
             self.optimizer=optax.chain(
                                 optax.clip_by_global_norm(self.trainer_config['max_grad_norm']),
-                                optax.inject_hyperparams(optax.adam)(
-                                    learning_rate=linear_schedule if self.trainer_config['anneal_lr'] 
-                                    else learning_rate, eps=1e-5, **optimizer_config
+                                optax.inject_hyperparams(optax.adamw)(
+                                    learning_rate=self.trainer_config['ent_coef']['initial'], **optimizer_config
                                 ),
                             )
             self.agent=PPOAgent(train_envs=train_envs,eval_env=eval_env,optimizer=self.optimizer, repr_model_fn=repr_fn,
                                 seq_model_fn=model_fn,actor_fn=actor_fn,critic_fn=critic_fn,
                                 num_steps=self.rollout_len,
-                                anneal_lr=self.trainer_config.get('anneal_lr', True),
                                 gamma=self.trainer_config.get('gamma', 0.99),
                                 gae_lambda=self.trainer_config.get('gae_lambda', 0.95),
                                 num_minibatches=self.trainer_config.get('num_minibatches', 4),
                                 update_epochs=self.trainer_config.get('update_epochs', 4),
                                 norm_adv=self.trainer_config.get('norm_adv', True),
                                 clip_coef=self.trainer_config.get('clip_coef', 0.1),
-                                ent_coef=self.trainer_config.get('ent_coef', 0.01),
+                                lr_schedule=lr_schedule,
+                                ent_schedule=ent_schedule,
                                 vf_coef=self.trainer_config.get('vf_coef', 0.5),
                                 max_grad_norm=self.trainer_config.get('max_grad_norm', 0.5),
-                                target_kl=self.trainer_config.get('target_kl', None))
+                                target_kl=self.trainer_config.get('target_kl', None),
+                                sequence_length=self.trainer_config.get('sequence_length', None))
 
         
         self.agent.reset(params_key,self.random_key)
@@ -139,6 +159,7 @@ class ControlTrainer(BaseTrainer):
         self.critic_losses=[]
         self.actor_losses=[]
         self.entropy_losses=[]
+        self.sps=[]
         self.result_data=[]
         self.reward_sum=0
         self.statistic_data=dict()
@@ -155,17 +176,26 @@ class ControlTrainer(BaseTrainer):
 
     def step(self, **kwargs):
         self.random_key=jax.random.split(self.random_key)[0]
+
+        #Measure steps per second
+        start_time=time.time()
+
         (loss,(value_loss,entropy_loss,actor_loss,rewards),infos)=self.agent.step(self.random_key)
         #Extract info data across all actors and steps
         #Get the leaves of the infos tree where the final_info key is present
         
         leaves=[info for info in infos if '_final_info' in info]
-
         # Increase the step counter
         self.step_count+=(self.B)
         #Iterate over the leaves and extract the final_info data
         for leaf in leaves:
              for env_info in leaf['final_info'][leaf['_final_info']]:  
+                 if 'final_info' in env_info:
+                     for key,value in env_info['final_info'].items(): #AutoResetWrapper adds everything in info to final_info after reset along with info from first timestep
+                        if isinstance(value, (int, float,)):
+                            if key not in self.statistic_data:
+                                self.statistic_data[key]=[]
+                            self.statistic_data[key].append(value)
                  for key,value in env_info.items():
                      if isinstance(value, (int, float,)):
                          if key not in self.statistic_data:
@@ -176,7 +206,10 @@ class ControlTrainer(BaseTrainer):
                  _,average_return_per_episode=average_reward_and_return_in_episode(ep_rewards,self.gamma)
                  self.average_return_per_episode.append(average_return_per_episode)
 
+
         # Log the data
+        end_time=time.time()
+        self.sps.append(self.B/(end_time-start_time))
         self.losses.append(loss)
         self.critic_losses.append(value_loss)
         self.actor_losses.append(actor_loss)
@@ -196,13 +229,15 @@ class ControlTrainer(BaseTrainer):
             loss=np.mean(self.losses)
             reward_mean=float(self.reward_sum/self.log_interval)
             return_mean=np.mean(self.average_return_per_episode)
+            mean_sps=np.mean(self.sps)
             self.reward_sum=0
             self.critic_losses=[]
             self.actor_losses=[]
             self.entropy_losses=[]
             self.losses=[]
+            self.sps=[]
             self.average_return_per_episode=[]
-            metrics={'step':self.step_count,'loss':loss,'critic_loss':critic_loss,
+            metrics={'step':self.step_count,'sps':mean_sps,'loss':loss,'critic_loss':critic_loss,
                                     'actor_loss':actor_loss,'entropy_loss':entropy_loss,'mean_reward':reward_mean,
                                     'return_per_episode':return_mean,
                                     **metrics
@@ -219,7 +254,7 @@ class ControlTrainer(BaseTrainer):
             metrics['step']=self.step_count
             metrics['eval_avg_episode_len']=float(avg_episode_len)
             metrics['eval_avg_episode_return']=float(avg_episode_return)
-            metrics['rollouts']=wandb.Video(rollouts, fps=15, format="gif")
+            metrics['rollouts']=wandb.Video(rollouts, fps=self.global_config.get('record_fps',5), format="gif")
         return loss,metrics,self.step_count
     
 

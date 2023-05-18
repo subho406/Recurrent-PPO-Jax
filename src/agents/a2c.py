@@ -71,7 +71,7 @@ class A2CAgent(BaseAgent):
     
     def step(self,random_key):
         #Unroll actor for rollout_len steps
-        h_tickminus1=self.h_tickminus1.copy()
+        h_tickminus1=jax.tree_map(lambda x: x,self.h_tickminus1) #Copy the hidden state
         #Need to remove values
         unroll_key,update_key=jax.random.split(random_key)
         unroll_data=self.unroll_actors(unroll_key)
